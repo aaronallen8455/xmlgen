@@ -144,7 +144,8 @@ defaultNamespace :: Namespace
 defaultNamespace = DefaultNamespace
 
 data NsEnv = NsEnv { ne_namespaceMap :: Map.Map Prefix Uri
-                   , ne_noNamespaceInUse :: Bool }
+                   , ne_noNamespaceInUse :: Bool
+                   }
 
 emptyNsEnv :: NsEnv
 emptyNsEnv = NsEnv Map.empty False
@@ -237,31 +238,29 @@ xentityRef name = Xml $
 
 -- | Construct a simple-named attribute by escaping its value.
 xattr :: Name -> TextContent -> Xml Attr
-xattr = xattrQ DefaultNamespace
+xattr = xattrQ []
 
 -- | Construct an attribute by escaping its value.
-xattrQ :: Namespace -> Name -> TextContent -> Xml Attr
+xattrQ :: [Namespace] -> Name -> TextContent -> Xml Attr
 xattrQ ns key value = xattrQRaw' ns (nameBuilder key) (textBuilder value)
 
 -- | Construct an attribute without escaping its value.
 -- /Note:/ attribute values are quoted with double quotes.
-xattrQRaw :: Namespace -> Name -> Builder -> Xml Attr
+xattrQRaw :: [Namespace] -> Name -> Builder -> Xml Attr
 xattrQRaw ns key value = xattrQRaw' ns (nameBuilder key) value
 
-xattrQRaw' :: Namespace -> Builder -> Builder -> Xml Attr
+xattrQRaw' :: [Namespace] -> Builder -> Builder -> Xml Attr
 xattrQRaw' ns' key valueBuilder = Xml $
     do uriMap' <- ask
-       let (mDecl, prefix, uriMap) = extendNsEnv True uriMap' ns'
-           nsDeclBuilder =
-               case mDecl of
-                 Nothing -> mempty
-                 Just (p, u) ->
-                     let uriBuilder = fromText u
-                         prefixBuilder =
-                             if T.null p then mempty else colonBuilder `mappend` fromText p
-                     in spaceBuilder `mappend` nsDeclStartBuilder
-                        `mappend` prefixBuilder `mappend` startBuilder `mappend` uriBuilder
-                        `mappend` endBuilder
+       let (decl, prefix, uriMap) = extendNsEnv True uriMap' ns'
+           nsDeclBuilder = foldMap buildDecl decl
+           buildDecl (p, u) =
+             let uriBuilder = fromText u
+                 prefixBuilder =
+                     if T.null p then mempty else colonBuilder `mappend` fromText p
+             in spaceBuilder `mappend` nsDeclStartBuilder
+                `mappend` prefixBuilder `mappend` startBuilder `mappend` uriBuilder
+                `mappend` endBuilder
            prefixBuilder =
                if T.null prefix
                   then spaceBuilder
@@ -320,70 +319,78 @@ instance Monoid (Xml Attr) where
 -- The various instances of this class allow the addition of different kinds
 -- of children.
 class AddChildren c where
-    addChildren :: c -> NsEnv -> Builder
+    addChildren :: c -> NsEnv -> (Builder, Bool) -- Is False for empty contents
 
 instance AddChildren (Xml Attr) where
     addChildren attrs uriMap =
        let (Attr builder', _) = runXml uriMap attrs
-       in builder' <> fromString "\n>"
+       in (builder' <> fromString "\n>", False)
 
 instance AddChildren (Xml Elem) where
     addChildren elems uriMap =
        let (Elem builder', _) = runXml uriMap elems
-       in fromString "\n>" `mappend` builder'
+       in (fromString "\n>" `mappend` builder', True)
 
 instance AddChildren (Xml Attr, Xml Elem) where
     addChildren (attrs, elems) uriMap =
         let (Attr builder, uriMap') = runXml uriMap attrs
             (Elem builder', _) = runXml uriMap' elems
-        in builder `mappend` fromString "\n>" `mappend` builder'
+        in (builder `mappend` fromString "\n>" `mappend` builder', True)
 
 instance AddChildren (Xml Attr, [Xml Elem]) where
-    addChildren (attrs, elems) uriMap = addChildren (attrs, xelems elems) uriMap
+    addChildren (attrs, elems) uriMap
+      | null elems = addChildren attrs uriMap
+      | otherwise = addChildren (attrs, xelems elems) uriMap
 
 instance AddChildren TextContent where
-    addChildren t _ = fromChar '>' <> textBuilder t
+    addChildren t _
+      | T.null t = (fromString "/>", False)
+      | otherwise = (fromChar '>' <> textBuilder t, True)
 
 instance AddChildren String where
-    addChildren t _ = fromChar '>' <> fromString t
+    addChildren t _
+      | null t = (fromString "/>", False)
+      | otherwise = (fromChar '>' <> fromString t, True)
 
 instance AddChildren () where
-    addChildren _ _ = fromChar '>'
+    addChildren _ _ = (fromString "/>", False)
 
 -- | Construct a simple-named element with the given children.
 xelem :: (AddChildren c) => Name -> c -> Xml Elem
-xelem = xelemQ DefaultNamespace
+xelem = xelemQ []
 
 -- | Construct a simple-named element without any children.
 xelemEmpty :: Name -> Xml Elem
-xelemEmpty name = xelemQ DefaultNamespace name (mempty :: Xml Elem)
+xelemEmpty name = xelemQ [] name ("" :: String)
 
 -- | Construct an element with the given children.
-xelemQ :: (AddChildren c) => Namespace -> Name -> c -> Xml Elem
+xelemQ :: (AddChildren c) => [Namespace] -> Name -> c -> Xml Elem
 xelemQ ns' name children = Xml $
     do oldUriMap <- ask
-       let (mDecl, prefix,!uriMap) = oldUriMap `seq` extendNsEnv False oldUriMap ns'
+       let (decl, prefix,!uriMap) = oldUriMap `seq` extendNsEnv False oldUriMap ns'
        let elemNameBuilder =
                if T.null prefix
                   then nameBuilder name
                   else fromText prefix `mappend` fromString ":" `mappend` nameBuilder name
        let nsDeclBuilder =
-               case mDecl of
-                 Nothing -> mempty
-                 Just (p, u) ->
-                     let prefixBuilder =
-                             if T.null p then mempty else fromChar ':' `mappend` fromText p
-                     in fromString " xmlns" `mappend` prefixBuilder `mappend` fromString "=\""
-                        `mappend` fromText u `mappend` fromString "\""
+               foldMap renderDecl decl
+           renderDecl (p, u) =
+               let prefixBuilder =
+                       if T.null p then mempty else fromChar ':' `mappend` fromText p
+               in fromString " xmlns" `mappend` prefixBuilder `mappend` fromString "=\""
+                  `mappend` fromText u `mappend` fromString "\""
        let b1 = fromString "<"
-       let b2 = b1 `mappend` elemNameBuilder `mappend` nsDeclBuilder
-       let b3 = b2 `mappend` addChildren children uriMap
-       let builderOut = Elem (b3 `mappend` fromString "</" `mappend` elemNameBuilder `mappend` fromString "\n>")
+           b2 = b1 `mappend` elemNameBuilder `mappend` nsDeclBuilder
+           (childBuilder, notEmpty) = addChildren children uriMap
+           b3 = b2 `mappend` childBuilder
+           builderOut
+             | notEmpty = Elem (b3 `mappend` fromString "</" `mappend` elemNameBuilder `mappend` fromString "\n>")
+             | otherwise = Elem (b3 `mappend` fromString "\n")
        return (builderOut, oldUriMap)
 
 -- | Construct an element without any children.
-xelemQEmpty :: Namespace -> Name -> Xml Elem
-xelemQEmpty ns name = xelemQ ns name (mempty :: Xml Elem)
+xelemQEmpty :: [Namespace] -> Name -> Xml Elem
+xelemQEmpty ns name = xelemQ ns name ("" :: String)
 
 -- |  Merges a list of elements into a single piece of XML at the element level.
 xelems :: [Xml Elem] -> Xml Elem
@@ -517,32 +524,34 @@ xrender r = fromBuilder $ builder r'
 -- Utilities
 --
 
-extendNsEnv :: Bool -> NsEnv -> Namespace -> (Maybe (Prefix, Uri), Prefix, NsEnv)
-extendNsEnv isAttr env ns =
-    case ns of
-      NoNamespace
-          | isAttr -> (Nothing, T.empty, env)
-          | otherwise ->
-              case Map.lookup T.empty (ne_namespaceMap env) of
-                Nothing ->  -- empty prefix not in use
-                  (Nothing, T.empty, env { ne_noNamespaceInUse = True })
-                Just uri -> -- empty prefix mapped to uri
-                  (Just (T.empty, T.empty), T.empty, env { ne_namespaceMap = Map.delete T.empty (ne_namespaceMap env)
-                                          , ne_noNamespaceInUse = True })
-      DefaultNamespace ->
-          (Nothing, T.empty, env)
-      QualifiedNamespace p' u ->
-          let p = if T.null p' && (isAttr || ne_noNamespaceInUse env) then T.pack "_" else p'
-              (mDecl, prefix, newMap) = genValidPrefix (ne_namespaceMap env) p u
-          in (mDecl, prefix, env { ne_namespaceMap = newMap })
-    where
-      genValidPrefix map prefix uri =
-        case Map.lookup prefix map of
-          Nothing -> (Just (prefix, uri), prefix, Map.insert prefix uri map)
-          Just foundUri ->
-              if foundUri == uri
-                 then (Nothing, prefix, map)
-                 else genValidPrefix map (T.cons '_' prefix) uri
+extendNsEnv :: Bool -> NsEnv -> [Namespace] -> ([(Prefix, Uri)], Prefix, NsEnv)
+extendNsEnv isAttr env nss = getPrefix $ foldr go ([], mempty, env) nss
+  where
+    getPrefix (a, pre, env) = (a, maybe mempty id $ M.getFirst pre, env)
+    go ns (uris, pre, env) =
+      case ns of
+        NoNamespace
+            | isAttr -> (uris, pre, env)
+            | otherwise ->
+                case Map.lookup T.empty (ne_namespaceMap env) of
+                  Nothing ->  -- empty prefix not in use
+                    (uris, pre, env { ne_noNamespaceInUse = True })
+                  Just uri -> -- empty prefix mapped to uri
+                    ((T.empty, T.empty) : uris, pre, env { ne_namespaceMap = Map.delete T.empty (ne_namespaceMap env)
+                                            , ne_noNamespaceInUse = True })
+        DefaultNamespace ->
+            (uris, pre, env)
+        QualifiedNamespace p' u ->
+            let p = if T.null p' && (isAttr || ne_noNamespaceInUse env) then T.pack "_" else p'
+                (mDecl, prefix, newMap) = genValidPrefix (ne_namespaceMap env) p u
+            in (maybe uris (:uris) mDecl, M.First (Just prefix) <> pre, env { ne_namespaceMap = newMap })
+    genValidPrefix map prefix uri =
+      case Map.lookup prefix map of
+        Nothing -> (Just (prefix, uri), prefix, Map.insert prefix uri map)
+        Just foundUri ->
+            if foundUri == uri
+               then (Nothing, prefix, map)
+               else genValidPrefix map (T.cons '_' prefix) uri
 
 escapeText :: T.Text -> T.Text
 escapeText = T.foldr escChar T.empty
@@ -603,7 +612,7 @@ xhtmlFramesetDocInfo = defaultDocInfo { docInfo_docType = Just xhtmlDoctypeFrame
 -- | Constructs the root element of an XHTML document.
 xhtmlRootElem :: T.Text -> Xml Elem -> Xml Elem
 xhtmlRootElem lang children =
-    xelemQ (namespace (T.pack "") (T.pack "http://www.w3.org/1999/xhtml")) (T.pack "html")
+    xelemQ [namespace (T.pack "") (T.pack "http://www.w3.org/1999/xhtml")] (T.pack "html")
            (xattr (T.pack "xml:lang") lang <>
             xattr (T.pack "lang") lang <#>
             children)
