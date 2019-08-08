@@ -324,7 +324,7 @@ class AddChildren c where
 instance AddChildren (Xml Attr) where
     addChildren attrs uriMap =
        let (Attr builder', _) = runXml uriMap attrs
-       in (builder' <> fromString "\n>", False)
+       in (builder' <> fromString "/>", False)
 
 instance AddChildren (Xml Elem) where
     addChildren elems uriMap =
